@@ -15,7 +15,10 @@ import datetime
 import pathlib
 from typing import Iterable, List
 
-from extensions.metrics.collector import Metrics, ModelMetrics
+from extensions.metrics.collector import CategoryStats, Metrics, ModelMetrics, RoleConfig
+
+# Stable display order for the agent's purpose categories.
+_CATEGORY_ORDER = ("task", "evolution", "consciousness", "review", "summarize", "other")
 
 
 def _fmt_int(n: int) -> str:
@@ -162,16 +165,22 @@ def render_markdown(m: Metrics) -> str:
              "Tool/commit attribution uses the dominant model per `task_id`._")
         push("")
 
+    # --- Configured roles ---
+    _render_roles_section(m.roles, m.models, lines)
+
+    # --- Per-category breakdown + model × category matrix ---
+    _render_category_section(m, lines)
+
     # --- Per-model deep dive ---
     if m.models:
-        push("## 3. Per-model breakdown")
+        push("## 5. Per-model breakdown")
         push("")
         for mm in sorted(m.models.values(),
                          key=lambda x: x.tokens.requests, reverse=True):
-            _render_model_section(mm, lines)
+            _render_model_section(mm, lines, m.roles)
 
     # --- Event-type histogram ---
-    push("## 4. Event-type histogram (events.jsonl)")
+    push("## 6. Event-type histogram (events.jsonl)")
     push("")
     if not m.event_type_counts:
         push("_(no events)_")
@@ -185,8 +194,124 @@ def render_markdown(m: Metrics) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _render_model_section(mm: ModelMetrics, out: List[str]) -> None:
-    out.append(f"### `{mm.model}`")
+def _ordered_categories(present: Iterable[str]) -> List[str]:
+    """Stable ordering: known categories first, then anything else alphabetically."""
+    present_set = set(present)
+    head = [c for c in _CATEGORY_ORDER if c in present_set]
+    tail = sorted(present_set - set(head))
+    return head + tail
+
+
+def _role_label(roles: RoleConfig, model: str) -> str:
+    """Render a role tag like `main, code` for the configured roles of a model."""
+    rs = roles.roles_by_model.get(model, [])
+    return ", ".join(rs) if rs else "—"
+
+
+def _render_roles_section(roles: RoleConfig, models: dict, out: List[str]) -> None:
+    """Show what the user configured (env vars) vs whether each role was used."""
+    out.append("## 3. Configured model roles")
+    out.append("")
+    any_role = any([roles.main, roles.code, roles.light, roles.websearch, roles.fallback])
+    if not any_role:
+        out.append("_No role config found. Pass `--config <file>` with `OUROBOROS_MODEL` / "
+                   "`OUROBOROS_MODEL_CODE` / `OUROBOROS_MODEL_LIGHT` / "
+                   "`OUROBOROS_WEBSEARCH_MODEL` / `OUROBOROS_MODEL_FALLBACK_LIST` "
+                   "keys, or set the env vars before running._")
+        out.append("")
+        return
+
+    def _seen(model: str) -> str:
+        mm = models.get(model)
+        if mm is None:
+            return "not used"
+        return f"{_fmt_int(mm.tokens.requests)} reqs · ${_fmt_float(mm.tokens.cost_usd, 4)}"
+
+    rows: List[List[str]] = []
+    rows.append(["main (`OUROBOROS_MODEL`)", f"`{roles.main}`" if roles.main else "—",
+                 _seen(roles.main) if roles.main else "—"])
+    rows.append(["code (`OUROBOROS_MODEL_CODE`)", f"`{roles.code}`" if roles.code else "—",
+                 _seen(roles.code) if roles.code else "—"])
+    rows.append(["light (`OUROBOROS_MODEL_LIGHT`)", f"`{roles.light}`" if roles.light else "—",
+                 _seen(roles.light) if roles.light else "—"])
+    rows.append(["websearch (`OUROBOROS_WEBSEARCH_MODEL`)", f"`{roles.websearch}`" if roles.websearch else "—",
+                 _seen(roles.websearch) if roles.websearch else "—"])
+    for i, fm in enumerate(roles.fallback):
+        rows.append([f"fallback #{i+1}", f"`{fm}`", _seen(fm)])
+    out.append(_table(["Role", "Configured model", "Actual usage"], rows))
+    out.append("")
+    # Flag unconfigured models that were nevertheless used (e.g. via LLM-driven switch_model)
+    configured = {m for m in (roles.main, roles.code, roles.light, roles.websearch) if m}
+    configured.update(roles.fallback)
+    unconfigured = sorted(set(models) - configured)
+    if unconfigured:
+        out.append("_Models used but **not** in role config (likely set via "
+                   "`switch_model` at runtime):_ "
+                   + ", ".join(f"`{m}`" for m in unconfigured))
+        out.append("")
+
+
+def _render_category_section(m: Metrics, out: List[str]) -> None:
+    """Per-purpose totals + model × category matrix."""
+    out.append("## 4. Per-purpose (category) breakdown")
+    out.append("")
+    if not m.by_category:
+        out.append("_No `llm_usage` events with a `category` field were found._")
+        out.append("")
+        return
+
+    cats = _ordered_categories(m.by_category.keys())
+
+    # 4a. Totals across all models, one row per category.
+    out.append("**Totals across all models** — purpose categories come from "
+               "`llm_usage.category` (set in `loop.py:_call_llm_with_retry`).")
+    out.append("")
+    cat_rows: List[List[str]] = []
+    for cat in cats:
+        cs = m.by_category[cat]
+        total_t = cs.prompt_tokens + cs.completion_tokens
+        cat_rows.append([
+            cat,
+            _fmt_int(cs.requests),
+            _fmt_int(cs.prompt_tokens),
+            _fmt_int(cs.completion_tokens),
+            _fmt_int(cs.cached_tokens),
+            _fmt_int(total_t),
+            _fmt_float(cs.cost_usd, 4),
+        ])
+    out.append(_table(
+        ["Category", "Requests", "Prompt tok", "Completion tok",
+         "Cached tok", "Total tok", "Cost (USD)"],
+        cat_rows,
+    ))
+    out.append("")
+
+    # 4b. Model × category matrix: requests in each cell, cost beneath.
+    out.append("**Model × category matrix** (cells: `requests` / `$cost`)")
+    out.append("")
+    header = ["Model \\ category"] + cats + ["Total reqs", "Total cost"]
+    matrix_rows: List[List[str]] = []
+    for mm in sorted(m.models.values(),
+                     key=lambda x: x.tokens.requests, reverse=True):
+        row = [f"`{mm.model}`"]
+        for cat in cats:
+            cs = mm.by_category.get(cat)
+            if cs is None or cs.requests == 0:
+                row.append("—")
+            else:
+                row.append(f"{_fmt_int(cs.requests)} / ${_fmt_float(cs.cost_usd, 4)}")
+        row.append(_fmt_int(mm.tokens.requests))
+        row.append(f"${_fmt_float(mm.tokens.cost_usd, 4)}")
+        matrix_rows.append(row)
+    out.append(_table(header, matrix_rows))
+    out.append("")
+
+
+def _render_model_section(mm: ModelMetrics, out: List[str],
+                          roles: RoleConfig = RoleConfig()) -> None:
+    role_tag = _role_label(roles, mm.model)
+    suffix = f" — roles: {role_tag}" if role_tag != "—" else ""
+    out.append(f"### `{mm.model}`{suffix}")
     out.append("")
     t, tl, c = mm.tokens, mm.tools, mm.commits
 
@@ -210,6 +335,28 @@ def _render_model_section(mm: ModelMetrics, out: List[str]) -> None:
         ],
     ))
     out.append("")
+
+    if mm.by_category:
+        out.append("**Usage by purpose (category)**")
+        out.append("")
+        cats = _ordered_categories(mm.by_category.keys())
+        rows = []
+        for cat in cats:
+            cs = mm.by_category[cat]
+            rows.append([
+                cat,
+                _fmt_int(cs.requests),
+                _fmt_int(cs.prompt_tokens),
+                _fmt_int(cs.completion_tokens),
+                _fmt_int(cs.cached_tokens),
+                _fmt_float(cs.cost_usd, 4),
+            ])
+        out.append(_table(
+            ["Category", "Requests", "Prompt tok", "Completion tok",
+             "Cached tok", "Cost (USD)"],
+            rows,
+        ))
+        out.append("")
 
     out.append("**Functional — tool-call reliability**")
     out.append("")

@@ -71,6 +71,16 @@ class CommitStats:
 
 
 @dataclass
+class CategoryStats:
+    """Per-(model, category) counters."""
+    requests: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+    cost_usd: float = 0.0
+
+
+@dataclass
 class TokenStats:
     """Non-functional: token / request counters for a single model."""
     requests: int = 0           # successful llm_usage events
@@ -90,6 +100,9 @@ class ModelMetrics:
     tokens: TokenStats = field(default_factory=TokenStats)
     tools: ToolStats = field(default_factory=ToolStats)
     commits: CommitStats = field(default_factory=CommitStats)
+    # category (purpose) → stats. Categories come from llm_usage events:
+    # task / evolution / consciousness / review / summarize / other.
+    by_category: Dict[str, CategoryStats] = field(default_factory=dict)
 
     @property
     def total_tokens(self) -> int:
@@ -102,6 +115,60 @@ class ModelMetrics:
     @property
     def avg_completion_per_req(self) -> float:
         return self.tokens.completion_tokens / self.tokens.requests if self.tokens.requests else 0.0
+
+
+@dataclass
+class RoleConfig:
+    """Configured model → role mapping from env vars / --config file.
+
+    Mirrors what the agent reads from os.environ (ouroboros/llm.py,
+    search.py, consciousness.py, context.py, loop.py).
+    """
+    main: str = ""           # OUROBOROS_MODEL — default for everything
+    code: str = ""           # OUROBOROS_MODEL_CODE — code edits (via switch_model)
+    light: str = ""          # OUROBOROS_MODEL_LIGHT — compaction, consciousness, VLM
+    websearch: str = ""      # OUROBOROS_WEBSEARCH_MODEL — web_search tool
+    fallback: List[str] = field(default_factory=list)
+    # filled by reverse-lookup; e.g. {"openai/gpt-5.2": ["main", "code"]}
+    roles_by_model: Dict[str, List[str]] = field(default_factory=dict)
+
+    @classmethod
+    def from_env_or_config(cls, config_path: Optional[pathlib.Path] = None) -> "RoleConfig":
+        """Load from --config JSON (overrides env), else from os.environ."""
+        import os
+        data: Dict[str, Any] = {}
+        if config_path is not None and config_path.is_file():
+            try:
+                raw = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    # Accept either {"CFG": {...}} or a flat dict
+                    data = raw.get("CFG", raw)
+            except (json.JSONDecodeError, OSError):
+                data = {}
+
+        def _get(key: str) -> str:
+            v = data.get(key)
+            if v is None:
+                v = os.environ.get(key, "")
+            return str(v or "").strip()
+
+        rc = cls(
+            main=_get("OUROBOROS_MODEL"),
+            code=_get("OUROBOROS_MODEL_CODE"),
+            light=_get("OUROBOROS_MODEL_LIGHT"),
+            websearch=_get("OUROBOROS_WEBSEARCH_MODEL"),
+            fallback=[
+                m.strip() for m in _get("OUROBOROS_MODEL_FALLBACK_LIST").split(",")
+                if m.strip()
+            ],
+        )
+        for role, model in (("main", rc.main), ("code", rc.code),
+                            ("light", rc.light), ("websearch", rc.websearch)):
+            if model:
+                rc.roles_by_model.setdefault(model, []).append(role)
+        for i, fm in enumerate(rc.fallback):
+            rc.roles_by_model.setdefault(fm, []).append(f"fallback#{i+1}")
+        return rc
 
 
 @dataclass
@@ -124,8 +191,11 @@ class Metrics:
     repo_root: str = ""
     logs_root: str = ""
     repo: RepoProfile = field(default_factory=RepoProfile)
+    roles: RoleConfig = field(default_factory=RoleConfig)
     models: Dict[str, ModelMetrics] = field(default_factory=dict)
     totals: ModelMetrics = field(default_factory=lambda: ModelMetrics(model="<all>"))
+    # per-category totals across all models
+    by_category: Dict[str, CategoryStats] = field(default_factory=dict)
     # event-types histogram from events.jsonl, for sanity
     event_type_counts: Counter = field(default_factory=Counter)
     # parser counters
@@ -261,8 +331,17 @@ def _dominant_model_per_task(events: Iterable[Dict[str, Any]]) -> Dict[str, str]
 # Main collect()
 # ---------------------------------------------------------------------------
 
-def collect(repo: pathlib.Path, logs: pathlib.Path) -> Metrics:
-    """Compute all metrics. Pure read; never writes, never imports ouroboros."""
+def collect(
+    repo: pathlib.Path,
+    logs: pathlib.Path,
+    config: Optional[pathlib.Path] = None,
+) -> Metrics:
+    """Compute all metrics. Pure read; never writes, never imports ouroboros.
+
+    `config` is an optional JSON file with role assignments
+    (`OUROBOROS_MODEL`, `OUROBOROS_MODEL_CODE`, ...). If omitted, the role
+    config is read from os.environ.
+    """
     import datetime
 
     metrics = Metrics(
@@ -270,6 +349,7 @@ def collect(repo: pathlib.Path, logs: pathlib.Path) -> Metrics:
         repo_root=str(repo.resolve()),
         logs_root=str(logs.resolve()),
         repo=_scan_static_repo(repo),
+        roles=RoleConfig.from_env_or_config(config),
     )
 
     events_path = logs / "events.jsonl"
@@ -304,18 +384,36 @@ def collect(repo: pathlib.Path, logs: pathlib.Path) -> Metrics:
             if not model:
                 continue
             b = _model_bucket(model)
+            pt = int(ev.get("prompt_tokens") or 0)
+            ct = int(ev.get("completion_tokens") or 0)
+            cached = int(ev.get("cached_tokens") or 0)
             b.tokens.requests += 1
-            b.tokens.prompt_tokens += int(ev.get("prompt_tokens") or 0)
-            b.tokens.completion_tokens += int(ev.get("completion_tokens") or 0)
-            b.tokens.cached_tokens += int(ev.get("cached_tokens") or 0)
+            b.tokens.prompt_tokens += pt
+            b.tokens.completion_tokens += ct
+            b.tokens.cached_tokens += cached
             b.tokens.cache_write_tokens += int(ev.get("cache_write_tokens") or 0)
             cost = ev.get("cost")
             if cost is None and isinstance(ev.get("usage"), dict):
                 cost = ev["usage"].get("cost")
             try:
-                b.tokens.cost_usd += float(cost or 0.0)
+                cost_f = float(cost or 0.0)
             except (TypeError, ValueError):
-                pass
+                cost_f = 0.0
+            b.tokens.cost_usd += cost_f
+            # Per-category breakdown (purpose). Default "other" when missing.
+            category = str(ev.get("category") or "other")
+            cs = b.by_category.setdefault(category, CategoryStats())
+            cs.requests += 1
+            cs.prompt_tokens += pt
+            cs.completion_tokens += ct
+            cs.cached_tokens += cached
+            cs.cost_usd += cost_f
+            gs = metrics.by_category.setdefault(category, CategoryStats())
+            gs.requests += 1
+            gs.prompt_tokens += pt
+            gs.completion_tokens += ct
+            gs.cached_tokens += cached
+            gs.cost_usd += cost_f
         elif et == "llm_api_error" and model:
             _model_bucket(model).tokens.api_errors += 1
         elif et == "llm_empty_response" and model:
@@ -384,6 +482,13 @@ def collect(repo: pathlib.Path, logs: pathlib.Path) -> Metrics:
         totals.commits.failed += b.commits.failed
         totals.tools.by_tool.update(b.tools.by_tool)
         totals.commits.failure_reasons.update(b.commits.failure_reasons)
+        for cat, cs in b.by_category.items():
+            tc = totals.by_category.setdefault(cat, CategoryStats())
+            tc.requests += cs.requests
+            tc.prompt_tokens += cs.prompt_tokens
+            tc.completion_tokens += cs.completion_tokens
+            tc.cached_tokens += cs.cached_tokens
+            tc.cost_usd += cs.cost_usd
     metrics.totals = totals
 
     return metrics

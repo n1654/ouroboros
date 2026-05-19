@@ -36,6 +36,16 @@ def main(argv: list[str] | None = None) -> int:
         default=pathlib.Path("metrics"),
         help="Output directory for markdown reports. Default: ./metrics",
     )
+    ap.add_argument(
+        "--config",
+        type=pathlib.Path,
+        default=None,
+        help="Optional JSON file with role assignments "
+             "(OUROBOROS_MODEL, OUROBOROS_MODEL_CODE, OUROBOROS_MODEL_LIGHT, "
+             "OUROBOROS_WEBSEARCH_MODEL, OUROBOROS_MODEL_FALLBACK_LIST). "
+             "Accepts either a flat dict or {'CFG': {...}}. "
+             "If omitted, these are read from os.environ.",
+    )
     ns = ap.parse_args(argv)
 
     if not ns.logs.is_dir():
@@ -44,8 +54,11 @@ def main(argv: list[str] | None = None) -> int:
     if not ns.repo.is_dir():
         print(f"error: --repo {ns.repo} is not a directory", file=sys.stderr)
         return 2
+    if ns.config is not None and not ns.config.is_file():
+        print(f"error: --config {ns.config} is not a file", file=sys.stderr)
+        return 2
 
-    metrics = collect(repo=ns.repo, logs=ns.logs)
+    metrics = collect(repo=ns.repo, logs=ns.logs, config=ns.config)
     report_path = write_report(metrics, ns.out)
 
     n_models = len(metrics.models)

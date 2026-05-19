@@ -18,16 +18,36 @@ It never imports the agent and never executes anything. It just:
 ```bash
 # from the repo root
 python -m extensions.metrics \
-    --repo . \
-    --logs /content/drive/MyDrive/Ouroboros/logs \
-    --out  metrics/
+    --repo   . \
+    --logs   /content/drive/MyDrive/Ouroboros/logs \
+    --out    metrics/ \
+    --config metrics_cfg.json    # optional
 ```
 
-| Flag    | Meaning                                                 | Default |
-|---------|---------------------------------------------------------|---------|
-| `--repo`| Repo root for static analysis (BIBLE.md, tools, tests). | `cwd`   |
-| `--logs`| Directory with `events.jsonl` and `tools.jsonl`.        | required|
-| `--out` | Where reports are written.                              | `./metrics` |
+| Flag      | Meaning                                                 | Default |
+|-----------|---------------------------------------------------------|---------|
+| `--repo`  | Repo root for static analysis (BIBLE.md, tools, tests). | `cwd`   |
+| `--logs`  | Directory with `events.jsonl` and `tools.jsonl`.        | required|
+| `--out`   | Where reports are written.                              | `./metrics` |
+| `--config`| JSON file with role assignments (see below).            | reads env vars |
+
+### Role config
+
+The user's `colab_launcher.py` CFG already has the five role keys. Save them
+to a JSON file and pass via `--config`:
+
+```json
+{
+  "OUROBOROS_MODEL":              "nvidia/nemotron-3-super-120b-a12b:free",
+  "OUROBOROS_MODEL_CODE":         "nvidia/nemotron-3-super-120b-a12b:free",
+  "OUROBOROS_MODEL_LIGHT":        "google/gemma-4-31b-it:free",
+  "OUROBOROS_WEBSEARCH_MODEL":    "nvidia/nemotron-3-super-120b-a12b:online",
+  "OUROBOROS_MODEL_FALLBACK_LIST":"openai/gpt-oss-120b:free"
+}
+```
+
+Either flat (as above) or `{"CFG": {...}}` is accepted. If `--config` is
+omitted, these are read from `os.environ`.
 
 The CLI prints the path of the new report. The full output goes to
 `metrics/<timestamp>/report.md` and `metrics/latest.md`.
@@ -73,6 +93,10 @@ write_report(m, Path("metrics"))    # persist to disk
 | Tokens per request (in/out) | totals ÷ requests |
 | Cost (USD) | sum of `cost` (or `usage.cost`) on `llm_usage` |
 | Tasks attributed to model | `task_done` events whose dominant model in `llm_usage` is this model |
+| **Per-purpose usage** | `category` field on `llm_usage` events (`task`/`evolution`/`consciousness`/`review`/`summarize`/`other`) — emitted by [`loop.py:_call_llm_with_retry`](../../ouroboros/loop.py) |
+| **Configured roles** | env vars / `--config` JSON: `OUROBOROS_MODEL` (main, also VLM), `_CODE`, `_LIGHT` (compaction/consciousness), `_WEBSEARCH_MODEL`, `_MODEL_FALLBACK_LIST` |
+| **Model × category matrix** | cross-tab of the two above |
+| **Unconfigured models in use** | models that appear in events but aren't in any role — typically reached via the `switch_model` tool at runtime |
 
 ## Per-model attribution
 
