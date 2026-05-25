@@ -1,13 +1,14 @@
 """
 Apply-patch shim for Claude Code CLI.
-Writes apply_patch script to /usr/local/bin/ on import.
+Writes the apply_patch script to a writable bin directory on install().
 
 Supports: *** Update File, *** Add File, *** Delete File, *** End of File.
 """
+import os
 import pathlib
 
 
-APPLY_PATCH_PATH = pathlib.Path("/usr/local/bin/apply_patch")
+_SCRIPT_NAME = "apply_patch"
 APPLY_PATCH_CODE = r"""#!/usr/bin/env python3
 import os
 import sys
@@ -171,8 +172,49 @@ if __name__ == "__main__":
 """
 
 
-def install():
-    """Install apply_patch script to /usr/local/bin/."""
-    APPLY_PATCH_PATH.parent.mkdir(parents=True, exist_ok=True)
-    APPLY_PATCH_PATH.write_text(APPLY_PATCH_CODE, encoding="utf-8")
-    APPLY_PATCH_PATH.chmod(0o755)
+def _candidate_dirs() -> list[pathlib.Path]:
+    """Bin directories to try, in order. First writable one wins.
+
+    Override the whole list with OUROBOROS_APPLY_PATCH_DIR — useful for venvs
+    or unusual setups.
+    """
+    override = os.environ.get("OUROBOROS_APPLY_PATCH_DIR")
+    if override:
+        return [pathlib.Path(override).expanduser()]
+    return [
+        pathlib.Path("/usr/local/bin"),                  # Colab / root-installed
+        pathlib.Path.home() / ".local" / "bin",          # per-user fallback
+    ]
+
+
+def _ensure_on_path(directory: pathlib.Path) -> None:
+    """Make sure the chosen directory is on PATH so `apply_patch` resolves."""
+    d_str = str(directory)
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    if d_str not in parts:
+        os.environ["PATH"] = d_str + os.pathsep + os.environ.get("PATH", "")
+
+
+def install() -> pathlib.Path:
+    """Install apply_patch shim to the first writable candidate dir.
+
+    Returns the install path. Raises RuntimeError if no candidate is writable.
+    """
+    last_err: Exception | None = None
+    for directory in _candidate_dirs():
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            target = directory / _SCRIPT_NAME
+            target.write_text(APPLY_PATCH_CODE, encoding="utf-8")
+            target.chmod(0o755)
+        except (PermissionError, OSError) as e:
+            last_err = e
+            continue
+        _ensure_on_path(directory)
+        return target
+
+    raise RuntimeError(
+        f"apply_patch: no writable bin directory among "
+        f"{[str(d) for d in _candidate_dirs()]}: {last_err}"
+    )
+

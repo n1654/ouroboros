@@ -7,6 +7,7 @@ Contract: chat(), default_model(), available_models(), add_usage().
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -15,6 +16,67 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def llm_base_url() -> str:
+    """Base URL for the LLM API.
+
+    Defaults to OpenRouter. Set OUROBOROS_LLM_BASE_URL to point at any
+    OpenAI-compatible /chat/completions endpoint — e.g. a self-hosted
+    model server: OUROBOROS_LLM_BASE_URL=http://127.0.0.1:8090
+    """
+    url = (os.environ.get("OUROBOROS_LLM_BASE_URL") or "").strip()
+    return (url or DEFAULT_BASE_URL).rstrip("/")
+
+
+def is_openrouter(base_url: Optional[str] = None) -> bool:
+    """True when the endpoint is OpenRouter.
+
+    Gates OpenRouter/Anthropic-only request features (reasoning effort,
+    provider pinning, prompt-cache tags) that a generic OpenAI-compatible
+    endpoint would reject.
+    """
+    url = base_url if base_url is not None else llm_base_url()
+    return "openrouter.ai" in str(url).lower()
+
+
+def llm_api_key() -> str:
+    """API key for the LLM endpoint.
+
+    OUROBOROS_LLM_API_KEY wins; falls back to OPENROUTER_API_KEY. A custom
+    endpoint that needs no key (e.g. a local model server) can leave both unset.
+    """
+    return (
+        os.environ.get("OUROBOROS_LLM_API_KEY")
+        or os.environ.get("OPENROUTER_API_KEY")
+        or ""
+    ).strip()
+
+
+def llm_extra_headers() -> Dict[str, str]:
+    """Extra HTTP headers sent with every LLM request.
+
+    OUROBOROS_LLM_HEADERS (a JSON object) overrides everything — used for
+    custom endpoints that require extra headers, e.g.:
+        {"X-Custom-Header": "value", "User-Agent": "custom-client"}
+    Falls back to OpenRouter ranking headers when talking to OpenRouter.
+    """
+    raw = (os.environ.get("OUROBOROS_LLM_HEADERS") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {str(k): str(v) for k, v in parsed.items()}
+            log.warning("OUROBOROS_LLM_HEADERS must be a JSON object — ignoring")
+        except (ValueError, TypeError):
+            log.warning("OUROBOROS_LLM_HEADERS is not valid JSON — ignoring")
+    if is_openrouter():
+        return {
+            "HTTP-Referer": "https://colab.research.google.com/",
+            "X-Title": "Ouroboros",
+        }
+    return {}
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -45,6 +107,10 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
     """
     import logging
     log = logging.getLogger("ouroboros.llm")
+
+    # Custom (non-OpenRouter) endpoints have no OpenRouter pricing catalogue.
+    if not is_openrouter():
+        return {}
 
     try:
         import requests
@@ -103,15 +169,20 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
 
 
 class LLMClient:
-    """OpenRouter API wrapper. All LLM calls go through this class."""
+    """OpenAI-compatible API wrapper. All LLM calls go through this class.
+
+    Defaults to OpenRouter; talks to any OpenAI-compatible /chat/completions
+    endpoint when OUROBOROS_LLM_BASE_URL is set (e.g. a self-hosted model).
+    """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: Optional[str] = None,
     ):
-        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        self._base_url = base_url
+        self._base_url = base_url or llm_base_url()
+        self._is_openrouter = is_openrouter(self._base_url)
+        self._api_key = api_key if api_key is not None else llm_api_key()
         self._client = None
 
     def _get_client(self):
@@ -119,11 +190,10 @@ class LLMClient:
             from openai import OpenAI
             self._client = OpenAI(
                 base_url=self._base_url,
-                api_key=self._api_key,
-                default_headers={
-                    "HTTP-Referer": "https://colab.research.google.com/",
-                    "X-Title": "Ouroboros",
-                },
+                # The OpenAI SDK requires a non-empty key; a custom endpoint
+                # that needs no auth simply ignores this placeholder.
+                api_key=self._api_key or "ouroboros-local",
+                default_headers=llm_extra_headers() or None,
             )
         return self._client
 
@@ -164,33 +234,46 @@ class LLMClient:
         client = self._get_client()
         effort = normalize_reasoning_effort(reasoning_effort)
 
-        extra_body: Dict[str, Any] = {
-            "reasoning": {"effort": effort, "exclude": True},
-        }
-
-        # Pin Anthropic models to Anthropic provider for prompt caching
-        if model.startswith("anthropic/"):
-            extra_body["provider"] = {
-                "order": ["Anthropic"],
-                "allow_fallbacks": False,
-                "require_parameters": True,
-            }
+        # Optional output-token cap for endpoints with smaller limits than
+        # OpenRouter (OUROBOROS_LLM_MAX_TOKENS).
+        cap = os.environ.get("OUROBOROS_LLM_MAX_TOKENS")
+        if cap:
+            try:
+                max_tokens = min(int(max_tokens), int(cap))
+            except (ValueError, TypeError):
+                pass
 
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "extra_body": extra_body,
         }
+
+        # Reasoning effort and Anthropic provider pinning are OpenRouter-only
+        # request features — a generic OpenAI-compatible endpoint may reject
+        # these unknown body fields, so only send them to OpenRouter.
+        if self._is_openrouter:
+            extra_body: Dict[str, Any] = {
+                "reasoning": {"effort": effort, "exclude": True},
+            }
+            if model.startswith("anthropic/"):
+                extra_body["provider"] = {
+                    "order": ["Anthropic"],
+                    "allow_fallbacks": False,
+                    "require_parameters": True,
+                }
+            kwargs["extra_body"] = extra_body
+
         if tools:
+            tools_payload = [t for t in tools]  # shallow copy
             # Add cache_control to last tool for Anthropic prompt caching
-            # This caches all tool schemas (they never change between calls)
-            tools_with_cache = [t for t in tools]  # shallow copy
-            if tools_with_cache:
-                last_tool = {**tools_with_cache[-1]}  # copy last tool
+            # (caches all tool schemas — they never change between calls).
+            # OpenRouter-only: a generic endpoint may reject the extra field.
+            if self._is_openrouter and tools_payload:
+                last_tool = {**tools_payload[-1]}  # copy last tool
                 last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-                tools_with_cache[-1] = last_tool
-            kwargs["tools"] = tools_with_cache
+                tools_payload[-1] = last_tool
+            kwargs["tools"] = tools_payload
             kwargs["tool_choice"] = tool_choice
 
         resp = client.chat.completions.create(**kwargs)
@@ -217,8 +300,10 @@ class LLMClient:
                 if cache_write:
                     usage["cache_write_tokens"] = int(cache_write)
 
-        # Ensure cost is present in usage (OpenRouter includes it, but fallback if missing)
-        if not usage.get("cost"):
+        # Ensure cost is present in usage (OpenRouter includes it, but fallback
+        # if missing). The Generation cost API is OpenRouter-only — skip it for
+        # custom endpoints, which simply report no cost.
+        if not usage.get("cost") and self._is_openrouter:
             gen_id = resp_dict.get("id") or ""
             if gen_id:
                 cost = self._fetch_generation_cost(gen_id)
@@ -293,3 +378,4 @@ class LLMClient:
         if light and light != main and light != code:
             models.append(light)
         return models
+

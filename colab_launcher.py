@@ -11,6 +11,53 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 log = logging.getLogger(__name__)
 
 # ----------------------------
+# Load .env (local/CLI runs) — in Colab the config cell + Secrets are used
+# ----------------------------
+def _load_dotenv() -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ.
+
+    For local/terminal runs. Checks OUROBOROS_ENV_FILE, then .env in the current
+    directory, then .env next to this script — and stops at the first one found.
+    Values already present in os.environ are NOT overridden, so an explicit
+    shell `export` (or Colab) always wins over the file.
+    """
+    candidates = []
+    explicit = os.environ.get("OUROBOROS_ENV_FILE")
+    if explicit:
+        candidates.append(pathlib.Path(explicit))
+    candidates.append(pathlib.Path.cwd() / ".env")
+    candidates.append(pathlib.Path(__file__).resolve().parent / ".env")
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
+            continue
+        loaded = 0
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            if not key:
+                continue
+            val = val.strip()
+            # Strip a single pair of matching surrounding quotes.
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]
+            os.environ.setdefault(key, val)
+            loaded += 1
+        print(f"[launcher] loaded {loaded} env vars from {path}")
+        return
+
+_load_dotenv()
+
+# ----------------------------
 # 0) Install launcher deps
 # ----------------------------
 def install_launcher_deps() -> None:
@@ -50,12 +97,21 @@ install_apply_patch()
 # ----------------------------
 # 1) Secrets + runtime config
 # ----------------------------
-from google.colab import userdata  # type: ignore
-from google.colab import drive  # type: ignore
+try:
+    from google.colab import userdata  # type: ignore
+    from google.colab import drive  # type: ignore
+    IN_COLAB = True
+except Exception:
+    # Local / terminal run — no Colab. Secrets come from .env / os.environ.
+    userdata = None  # type: ignore
+    drive = None  # type: ignore
+    IN_COLAB = False
 
 _LEGACY_CFG_WARNED: Set[str] = set()
 
 def _userdata_get(name: str) -> Optional[str]:
+    if userdata is None:
+        return None
     try:
         return userdata.get(name)
     except Exception:
@@ -90,7 +146,16 @@ def _parse_int_cfg(raw: Optional[str], default: int, minimum: int = 0) -> int:
         val = default
     return max(minimum, val)
 
-OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", required=True)
+# LLM endpoint — OpenRouter by default, or any OpenAI-compatible endpoint
+# (e.g. a self-hosted model) via OUROBOROS_LLM_BASE_URL.
+LLM_BASE_URL = get_cfg("OUROBOROS_LLM_BASE_URL", default="https://openrouter.ai/api/v1", allow_legacy_secret=True)
+USING_CUSTOM_LLM = "openrouter.ai" not in str(LLM_BASE_URL or "").lower()
+LLM_API_KEY = get_cfg("OUROBOROS_LLM_API_KEY", default="", allow_legacy_secret=True) or ""
+LLM_HEADERS = get_cfg("OUROBOROS_LLM_HEADERS", default="", allow_legacy_secret=True) or ""
+LLM_MAX_TOKENS = get_cfg("OUROBOROS_LLM_MAX_TOKENS", default="", allow_legacy_secret=True) or ""
+
+# OpenRouter key is required only when actually talking to OpenRouter.
+OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", default="", required=not USING_CUSTOM_LLM)
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", required=True)
 TOTAL_BUDGET_DEFAULT = get_secret("TOTAL_BUDGET", required=True)
 GITHUB_TOKEN = get_secret("GITHUB_TOKEN", required=True)
@@ -133,7 +198,14 @@ DIAG_SLOW_CYCLE_SEC = _parse_int_cfg(
     minimum=0,
 )
 
-os.environ["OPENROUTER_API_KEY"] = str(OPENROUTER_API_KEY)
+os.environ["OPENROUTER_API_KEY"] = str(OPENROUTER_API_KEY or "")
+os.environ["OUROBOROS_LLM_BASE_URL"] = str(LLM_BASE_URL or "https://openrouter.ai/api/v1")
+if LLM_API_KEY:
+    os.environ["OUROBOROS_LLM_API_KEY"] = str(LLM_API_KEY)
+if LLM_HEADERS:
+    os.environ["OUROBOROS_LLM_HEADERS"] = str(LLM_HEADERS)
+if LLM_MAX_TOKENS:
+    os.environ["OUROBOROS_LLM_MAX_TOKENS"] = str(LLM_MAX_TOKENS)
 os.environ["OPENAI_API_KEY"] = str(OPENAI_API_KEY or "")
 os.environ["ANTHROPIC_API_KEY"] = str(ANTHROPIC_API_KEY or "")
 os.environ["GITHUB_USER"] = str(GITHUB_USER)
@@ -150,13 +222,21 @@ if str(ANTHROPIC_API_KEY or "").strip():
     ensure_claude_code_cli()
 
 # ----------------------------
-# 2) Mount Drive
+# 2) Data + repo locations
 # ----------------------------
-if not pathlib.Path("/content/drive/MyDrive").exists():
-    drive.mount("/content/drive")
+# Colab: agent state lives on Google Drive, repo is cloned to /content.
+# Local/CLI: configurable via OUROBOROS_DATA_DIR / OUROBOROS_REPO_DIR.
+if IN_COLAB:
+    if not pathlib.Path("/content/drive/MyDrive").exists():
+        drive.mount("/content/drive")
+    _default_data = "/content/drive/MyDrive/Ouroboros"
+    _default_repo = "/content/ouroboros_repo"
+else:
+    _default_data = str(pathlib.Path.home() / "ouroboros_data")
+    _default_repo = str(pathlib.Path(__file__).resolve().parent)
 
-DRIVE_ROOT = pathlib.Path("/content/drive/MyDrive/Ouroboros").resolve()
-REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
+DRIVE_ROOT = pathlib.Path(os.environ.get("OUROBOROS_DATA_DIR") or _default_data).resolve()
+REPO_DIR = pathlib.Path(os.environ.get("OUROBOROS_REPO_DIR") or _default_repo).resolve()
 
 for sub in ["state", "logs", "memory", "index", "locks", "archive"]:
     (DRIVE_ROOT / sub).mkdir(parents=True, exist_ok=True)
@@ -266,6 +346,7 @@ append_jsonl(DRIVE_ROOT / "logs" / "supervisor.jsonl", {
     "sha": load_state().get("current_sha"),
     "max_workers": MAX_WORKERS,
     "model_default": MODEL_MAIN, "model_code": MODEL_CODE, "model_light": MODEL_LIGHT,
+    "llm_base_url": str(LLM_BASE_URL), "llm_custom": USING_CUSTOM_LLM,
     "soft_timeout_sec": SOFT_TIMEOUT_SEC, "hard_timeout_sec": HARD_TIMEOUT_SEC,
     "worker_start_method": str(os.environ.get("OUROBOROS_WORKER_START_METHOD") or ""),
     "diag_heartbeat_sec": DIAG_HEARTBEAT_SEC,
@@ -725,3 +806,4 @@ while True:
     # Short sleep in active mode (fast response), longer when idle (save CPU)
     _loop_sleep = 0.1 if (_now - _last_message_ts) < _ACTIVE_MODE_SEC else 0.5
     time.sleep(_loop_sleep)
+

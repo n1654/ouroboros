@@ -35,8 +35,15 @@ def export_secret_to_env(name: str, required: bool = False) -> Optional[str]:
 
 
 # Export required runtime secrets so subprocess launcher can always read env fallback.
-for _name in ("OPENROUTER_API_KEY", "TELEGRAM_BOT_TOKEN", "TOTAL_BUDGET", "GITHUB_TOKEN"):
+for _name in ("TELEGRAM_BOT_TOKEN", "TOTAL_BUDGET", "GITHUB_TOKEN"):
     export_secret_to_env(_name, required=True)
+
+# OpenRouter key is required only on the default OpenRouter endpoint.
+# A custom OpenAI-compatible endpoint (OUROBOROS_LLM_BASE_URL, set in the
+# config cell) needs no OpenRouter key.
+_llm_base = os.environ.get("OUROBOROS_LLM_BASE_URL", "").strip().lower()
+_using_custom_llm = bool(_llm_base) and "openrouter.ai" not in _llm_base
+export_secret_to_env("OPENROUTER_API_KEY", required=not _using_custom_llm)
 
 # Optional secrets (keep empty if missing).
 for _name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
@@ -102,3 +109,4 @@ if not pathlib.Path("/content/drive/MyDrive").exists():
 launcher_path = REPO_DIR / "colab_launcher.py"
 assert launcher_path.exists(), f"Missing launcher: {launcher_path}"
 subprocess.run([sys.executable, str(launcher_path)], cwd=str(REPO_DIR), check=True)
+

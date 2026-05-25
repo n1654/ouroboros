@@ -4,7 +4,6 @@ Models are NOT hardcoded — the LLM chooses which models to use based on
 prompt guidance. Budget is tracked via llm_usage events.
 """
 
-import os
 import json
 import asyncio
 import logging
@@ -20,8 +19,6 @@ log = logging.getLogger(__name__)
 MAX_MODELS = 10
 # Concurrency limit for parallel requests
 CONCURRENCY_LIMIT = 5
-
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def get_tools():
@@ -87,16 +84,13 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "", prompt: str 
         return json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)
 
 
-async def _query_model(client, model, messages, api_key, semaphore):
+async def _query_model(client, model, messages, url, headers, semaphore):
     """Query a single model with semaphore-based concurrency control. Returns (model, response_dict, headers_dict) or (model, error_str, None)."""
     async with semaphore:
         try:
             resp = await client.post(
-                OPENROUTER_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
+                url,
+                headers=headers,
                 json={
                     "model": model,
                     "messages": messages,
@@ -146,9 +140,18 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
     if len(models) == 0:
         return {"error": "At least one model is required"}
 
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
+    # Route through the configured LLM endpoint (OpenRouter by default, or a
+    # custom OpenAI-compatible endpoint via OUROBOROS_LLM_BASE_URL).
+    from ouroboros.llm import llm_base_url, llm_api_key, llm_extra_headers, is_openrouter
+
+    api_key = llm_api_key()
+    if is_openrouter() and not api_key:
         return {"error": "OPENROUTER_API_KEY not set"}
+
+    url = llm_base_url() + "/chat/completions"
+    headers = {"Content-Type": "application/json", **llm_extra_headers()}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     messages = [
         {"role": "system", "content": prompt},
@@ -158,7 +161,7 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
     # Query all models with bounded concurrency
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     async with httpx.AsyncClient() as client:
-        tasks = [_query_model(client, m, messages, api_key, semaphore) for m in models]
+        tasks = [_query_model(client, m, messages, url, headers, semaphore) for m in models]
         results = await asyncio.gather(*tasks)
 
     # Parse and process results
@@ -274,3 +277,4 @@ def _emit_usage_event(review_result: dict, ctx: ToolContext) -> None:
     elif hasattr(ctx, "pending_events"):
         # No event_queue — use pending_events
         ctx.pending_events.append(usage_event)
+
