@@ -175,7 +175,7 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "") -> str:
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        return "⚠️ ANTHROPIC_API_KEY not set, claude_code_edit unavailable."
+        return "⚠️ Code-editing LLM API key not set, claude_code_edit unavailable."
 
     work_dir = str(ctx.repo_dir)
     if cwd and cwd.strip() not in ("", ".", "./"):
@@ -185,9 +185,9 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "") -> str:
 
     claude_bin = shutil.which("claude")
     if not claude_bin:
-        return "⚠️ Claude CLI not found. Ensure ANTHROPIC_API_KEY is set."
+        return "⚠️ Code-editing CLI not found. Ensure the editor LLM API key is set."
 
-    ctx.emit_progress_fn("Delegating to Claude Code CLI...")
+    ctx.emit_progress_fn("Delegating to code-editing CLI...")
 
     lock = _acquire_git_lock(ctx)
     try:
@@ -258,3 +258,4 @@ def get_tools() -> List[ToolEntry]:
             }, "required": ["prompt"]},
         }, _claude_code_edit, is_code_tool=True, timeout_sec=300),
     ]
+

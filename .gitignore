@@ -19,9 +19,15 @@ build/
 .pytest_cache/
 .mypy_cache/
 
+# Virtual Env
+.venv/
+venv/
+py-env/
+
 # OS
 .DS_Store
 Thumbs.db
+
 
 # Release artifacts (not tracked)
 .create_release.py
