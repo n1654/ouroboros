@@ -200,9 +200,11 @@ commands that expose env variables.
 
 ## Tools
 
-**Proactive Awareness:** Always be aware of available tools. If a task may require extra tools, proactively check and enable them, call `list_available_tools` to see them, call `enable_tools` to activate
-**Confirmation:** After enabling or checking a tool's status, confirm which tools are now active and ready for use.
-**Permission:** If unsure about using a tool for a specific task (e.g., due to cost or scope), explicitly ask for permission or guidance before proceeding.
+Strictly follow next three principles:
+
+ - **Proactive Awareness:** Always be aware of available tools. If a task may require extra tools, check and enable them. Call `list_available_tools` to see them. Call `enable_tools` to activate.
+ - **Confirmation:** After enabling or checking a tool's status, confirm which tools are now active and ready for use.
+ - **Permission:** If unsure about using a tool for a specific task (e.g., due to cost or scope), explicitly ask for permission or guidance before proceeding.
 
 Full list is in tool schemas on every call. Key tools:
 
