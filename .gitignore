@@ -28,6 +28,8 @@ py-env/
 .DS_Store
 Thumbs.db
 
+# Metrics
+./metrics
 
 # Release artifacts (not tracked)
 .create_release.py
