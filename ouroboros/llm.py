@@ -249,6 +249,13 @@ class LLMClient:
             "max_tokens": max_tokens,
         }
 
+        top_p_env = os.environ.get("OUROBOROS_LLM_TOP_P")
+        if top_p_env:
+            try:
+                kwargs["top_p"] = float(top_p_env)
+            except (ValueError, TypeError):
+                pass
+
         # Reasoning effort and Anthropic provider pinning are OpenRouter-only
         # request features — a generic OpenAI-compatible endpoint may reject
         # these unknown body fields, so only send them to OpenRouter.
