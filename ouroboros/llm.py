@@ -256,6 +256,13 @@ class LLMClient:
             except (ValueError, TypeError):
                 pass
 
+        temperature_env = os.environ.get("OUROBOROS_LLM_TEMPERATURE")
+        if temperature_env:
+            try:
+                kwargs["temperature"] = float(temperature_env)
+            except (ValueError, TypeError):
+                pass
+
         # Reasoning effort and Anthropic provider pinning are OpenRouter-only
         # request features — a generic OpenAI-compatible endpoint may reject
         # these unknown body fields, so only send them to OpenRouter.
