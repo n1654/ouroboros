@@ -488,14 +488,17 @@ def _maybe_inject_self_check(
     emit_progress(f"🔄 Checkpoint {checkpoint_num} at round {round_idx}: ~{ctx_tokens} tokens, ${task_cost:.2f} spent")
 
 
-def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
+def _setup_dynamic_tools(tools_registry, tool_schemas):
     """
     Wire tool-discovery handlers onto an existing tool_schemas list.
 
-    Creates closures for list_available_tools / enable_tools, registers them
-    as handler overrides, and injects a system message advertising non-core
-    tools.  Mutates tool_schemas in-place (via list.append) when tools are
-    enabled, so the caller's reference stays live.
+    Creates closures for list_available_tools / enable_tools and registers
+    them as handler overrides. Mutates tool_schemas in-place (via list.append)
+    when tools are enabled, so the caller's reference stays live.
+
+    Non-core tools are advertised to the model through the description of
+    `list_available_tools` itself (see ouroboros/tools/tool_discovery.py),
+    which is part of the core tool set and visible in every request.
 
     Returns (tool_schemas, enabled_extra_set).
     """
@@ -532,18 +535,6 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
 
     tools_registry.override_handler("list_available_tools", _handle_list_tools)
     tools_registry.override_handler("enable_tools", _handle_enable_tools)
-
-    non_core_count = len(tools_registry.list_non_core_tools())
-    if non_core_count > 0:
-        messages.append({
-            "role": "system",
-            "content": (
-                f"Note: You have {len(tool_schemas)} core tools loaded. "
-                f"There are {non_core_count} additional tools available "
-                f"(use `list_available_tools` to see them, `enable_tools` to activate). "
-                f"Core tools cover most tasks. Enable extras only when needed."
-            ),
-        })
 
     return tool_schemas, enabled_extra
 
@@ -628,7 +619,7 @@ def run_llm_loop(
 
     # Selective tool schemas: core set + meta-tools for discovery.
     tool_schemas = tools.schemas(core_only=True)
-    tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(tools, tool_schemas, messages)
+    tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(tools, tool_schemas)
 
     # Set budget tracking on tool context for real-time usage events
     tools._ctx.event_queue = event_queue
