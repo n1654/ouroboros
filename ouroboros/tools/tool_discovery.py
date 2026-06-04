@@ -69,8 +69,7 @@ def get_tools() -> List[ToolEntry]:
                     "Your active tool set is a curated core subset — additional non-core "
                     "tools exist but are not loaded by default to keep context lean. "
                     "Call this to list those extras (name + description for each), then "
-                    "use `enable_tools` to activate the ones you need. Core tools cover "
-                    "most tasks; reach for extras only when a specific task calls for them."
+                    "use `enable_tools` to activate the ones you need."
                 ),
                 "parameters": {
                     "type": "object",
